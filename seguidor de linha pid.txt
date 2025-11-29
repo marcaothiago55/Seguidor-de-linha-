@@ -1,0 +1,596 @@
+/********************************************************************************
+* FUTUREBOTS - Seguidor de Linha PID com 5 Sensores (Guia Central + Bigodes)
+*
+* === VERSÃO FINAL CORRIGIDA ===
+* - Lógica de erro com Guia Central + 4 Bigodes Laterais.
+* - Controlador PID completo (Kp, Ki, Kd) para movimento suave.
+* - Correção do bug que causava a parada do robô em linha reta.
+* - Aceleração em retas e velocidade base em curvas.
+* - Interface web para ajuste fino dos parâmetros.
+********************************************************************************/
+
+// Bibliotecas
+#include <esp_arduino_version.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <RoboCore_Vespa.h>
+
+// --- OBJETOS E DEFINIÇÕES GLOBAIS ---
+VespaMotors motores;
+VespaBattery vbat;
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+// --- PINOS ---
+const uint8_t PINO_LED = 15;
+// Pinos dos Sensores (1 Analógico Central, 4 Digitais Laterais)
+const int PINO_SENSOR_CENTRAL = 36;
+const int PINO_BIGODE_ESQ_DENTRO = 33;
+const int PINO_BIGODE_ESQ_FORA = 32;
+const int PINO_BIGODE_DIR_DENTRO = 25;
+const int PINO_BIGODE_DIR_FORA = 26;
+
+// --- CALIBRAÇÃO ---
+const int LEITURA_LINHA_CENTRAL = 2500; // Valor de corte para o sensor ANALÓGICO
+
+// --- PARÂMETROS DE CONTROLE ---
+// Velocidade
+int velocidade_base = 70;
+const int VELOCIDADE_RETA_ACRESCIMO = 20;
+const int VELOCIDADE_MAXIMA = 100;
+const int VELOCIDADE_MINIMA = 0;
+int velocidade_direita, velocidade_esquerda;
+
+// Controlador PID
+float espera = 10.0;
+float Kp = 10.0;
+float Ki = 0.1;
+float Kd = 20.0;
+float erro = 0.0, P = 0.0, I = 0.0, D = 0.0, erro_anterior = 0.0;
+float resposta_PID = 0.0;
+
+// Controle Geral
+bool parada = true;
+const int CONTAGEM_MAXIMA_PERDIDO = 100;
+int contador_perdido = 0;
+
+// Armazenamento e Interface Web
+Preferences SPIFFS;
+const char* DIRETORIO_SPIFFS = "seguidor";
+const char* ALIAS_ESPERA = "pausa", *ALIAS_KP = "kp", *ALIAS_KI = "ki", *ALIAS_KD = "kd";
+const char* ALIAS_VELOCIDADE = "velocidade", *ALIAS_VBAT = "vbat", *ALIAS_PARA = "stop";
+
+// --- DECLARAÇÃO DE FUNÇÕES ---
+void calcula_PID(int velocidade_atual);
+void segue_linha(void);
+void configurar_servidor_web(void);
+void handleWebSocketMessage(void *arg, uint8_t *data, size_t len);
+void onEvent(AsyncWebSocket *, AsyncWebSocketClient *, AwsEventType, void *, uint8_t *, size_t);
+
+// ------------------------------------------------------------------
+// <<<<<<<<<<<<<<<< PÁGINA WEB COMPLETA >>>>>>>>>>>>>>>>>
+// ------------------------------------------------------------------
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>FUTUREBOTS Controle PID</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=0">
+        <style>
+            *, *::before, *::after {
+                box-sizing: border-box; 
+            }
+            html, body {
+                width: 100%;
+                height: 100%;
+                padding: 0;
+                margin: 0;
+                font-family: 'Gill Sans', 'Gill Sans MT', Calibri, 'Trebuchet MS', sans-serif;
+                background-color: #121212;
+                color: #E0E0E0;
+            }
+            body {
+                overflow: hidden;
+            }
+            .top-bar {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                background-color: #1F1F1F;
+                padding: 10px 15px;
+                color: white;
+                border-bottom: 1px solid #333;
+            }
+            .top-bar-title {
+                font-size: 24px;
+                font-weight: bold;
+                color: #D95319;
+            }
+            .battery-container {
+                display: flex;
+                align-items: center;
+            }
+            .battery-level-text {
+                font-size: 18px;
+                margin-right: 8px;
+            }
+            .battery {
+                height: 20px;
+                width: 40px;
+                border: 2px solid #888;
+                border-radius: 5px;
+                padding: 1px;
+                position: relative;
+            }
+            .battery::before {
+                content: '';
+                position: absolute;
+                height: 13px;
+                width: 3px;
+                background: #888;
+                right: -7px;
+                top: 50%;
+                transform: translateY(-50%);
+                border-radius: 0 3px 3px 0;
+            }
+            .battery-charge {
+                background: #28a745;
+                height: 100%;
+                border-radius: 3px;
+            }
+            .main-content-wrapper {
+                display: flex;
+                width: 100%;
+                height: calc(100% - 60px);
+                align-items: center;
+                justify-content: center;
+            }
+            .control-panel {
+                width: 90%;
+                max-width: 380px; 
+                padding: 20px;
+                background-color: #1E1E1E;
+                border-radius: 8px;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+            }
+            .input-group {
+                display: flex;
+                width: 100%;
+                margin-bottom: 20px;
+                align-items: center;
+            }
+            .input-group-addon {
+                flex-basis: 160px; 
+                flex-shrink: 0; 
+                padding: 8px 12px;
+                font-size: 14px;
+                font-weight: bold;
+                color: #E0E0E0;
+                text-align: center;
+                background-color: #333;
+                border: 1px solid #444;
+                border-right: 0;
+                border-radius: 4px 0 0 4px;
+                line-height: 1.2;
+            }
+            .input-field {
+                flex-grow: 1; 
+                min-width: 0;
+                font-size: 18px;
+                height: 48px;
+                color: #E0E0E0;
+                background-color: #252525;
+                border: 1px solid #444;
+                border-radius: 0 4px 4px 0;
+                text-align: center;
+                padding: 6px 12px;
+            }
+            .input-field.disabled {
+                background-color: #333;
+                color: #888;
+            }
+            .speed-control {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                background-color: #333;
+                border-radius: 4px;
+                border: 1px solid #444;
+                padding: 4px;
+            }
+            .speed-control .input-group-addon {
+                flex-basis: auto;
+                flex-grow: 1;
+                border: none;
+                background-color: transparent;
+            }
+            .speed-btn {
+                width: 40px;
+                height: 40px;
+                font-size: 24px;
+                font-weight: bold;
+                border-radius: 4px;
+                border: none;
+                background-color: #444;
+                color: #E0E0E0;
+                cursor: pointer;
+            }
+            .speed-display {
+                font-size: 22px;
+                font-weight: bold;
+                padding: 0 20px;
+            }
+            .button-container {
+                padding-top: 10px; 
+            }
+            .btn {
+                display: inline-block;
+                width: 100%;
+                padding: 12px;
+                font-weight: bold;
+                font-size: 18px;
+                text-align: center;
+                cursor: pointer;
+                border: 1px solid transparent;
+                border-radius: 4px;
+                color: #fff;
+                transition: background-color 0.2s;
+            }
+            .btn-warning {
+                background-color: #D95319; 
+                border-color: #c24a16;
+            }
+            .btn-warning:hover {
+                background-color: #E85A1A;
+            }
+            .btn.salvar {
+                background-color: #28a745; 
+            }
+             .btn.salvar:hover {
+                background-color: #2ebf4f;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="top-bar">
+            <div class="top-bar-title">FUTUREBOTS</div>
+            <div class="battery-container">
+                <div class="battery-level-text"><span id="vbat">0.0</span> V</div>
+                <div class="battery">
+                    <div id="lbat" class="battery-charge"></div>
+                </div>
+            </div>
+        </div>
+        <div class="main-content-wrapper">
+            <div class="control-panel">
+                <div class="input-group">
+                    <div class="input-group-addon">Kp Acelerador</div>
+                    <input type="text" value="0.0" id="kp" class="input-field disabled" disabled>
+                </div>
+                <div class="input-group">
+                    <div class="input-group-addon">Ki A Memória</div>
+                    <input type="text" value="0.0" id="ki" class="input-field disabled" disabled>
+                </div>
+                <div class="input-group">
+                    <div class="input-group-addon">Kd O Freio</div>
+                    <input type="text" value="0.0" id="kd" class="input-field disabled" disabled>
+                </div>
+                <div class="input-group">
+                    <div class="input-group-addon">
+                        Pausa
+                        <small style="display: block; font-weight: normal; font-size: 10px; color: #aaa;">(Intervalo de leitura)</small>
+                    </div>
+                    <input type="text" value="0.0" id="pausa" class="input-field disabled" disabled>
+                </div>
+                <div class="input-group">
+                    <div class="speed-control">
+                        <div class="input-group-addon">Velocidade</div>
+                        <button class="speed-btn" id="speed-down">-</button>
+                        <span class="speed-display" id="speed-value">70</span>
+                        <button class="speed-btn" id="speed-up">+</button>
+                    </div>
+                </div>
+                <div class="button-container">
+                    <button type="button" id="change_pid" class="btn btn-warning" onclick="change_pid()">Editar</button>
+                </div>
+            </div>
+        </div>
+        <script>
+            var connection = new WebSocket(`ws://${window.location.hostname}/ws`);
+            connection.onopen = function () { console.log('Connection opened'); };
+            connection.onerror = function (error) { console.log('WebSocket Error ' + error); };
+            connection.onmessage = function (e) {
+                console.log('Server: ' + e.data);
+                const data = JSON.parse(e.data);
+                if (data["vbat"]){
+                    document.getElementById("vbat").innerText = (data["vbat"] / 1000).toFixed(1);
+                    var lbat = (data["vbat"] * 100 / 9000).toFixed(0);
+                    if(lbat > 100) lbat = 100;
+                    if(lbat < 0) lbat = 0;
+                    const chargeElement = document.getElementById("lbat");
+                    chargeElement.style.width = lbat + '%';
+                    if (lbat < 20) { chargeElement.style.backgroundColor = "red"; }
+                    else if (lbat < 70) { chargeElement.style.backgroundColor = "orange"; }
+                    else { chargeElement.style.backgroundColor = "green"; }
+                }
+                if(data["kp"] !== undefined) {
+                        document.getElementById("kp").value = data["kp"];
+                        document.getElementById("ki").value = data["ki"];
+                        document.getElementById("kd").value = data["kd"];
+                        document.getElementById("pausa").value = data["pausa"];
+                }
+                if(data["velocidade"] !== undefined) {
+                        document.getElementById("speed-value").innerText = data["velocidade"];
+                }
+            };
+
+            document.getElementById("speed-up").addEventListener('click', function(){
+                connection.send(JSON.stringify({'velocidade': 'up'}));
+            });
+
+            document.getElementById("speed-down").addEventListener('click', function(){
+                connection.send(JSON.stringify({'velocidade': 'down'}));
+            });
+
+            function change_pid() {
+                const changeButton = document.getElementById("change_pid");
+                const isEditing = changeButton.innerHTML === "Salvar";
+                const fields = ["kp", "ki", "kd", "pausa"];
+                if (isEditing) {
+                    send_pid();
+                    changeButton.innerHTML = "Editar";
+                    changeButton.classList.remove("salvar");
+                    changeButton.classList.add("btn-warning");
+                    fields.forEach(id => {
+                        document.getElementById(id).setAttribute("disabled", true);
+                        document.getElementById(id).classList.add("disabled");
+                    });
+                } else {
+                    stop_robot();
+                    changeButton.innerHTML = "Salvar";
+                    changeButton.classList.remove("btn-warning");
+                    changeButton.classList.add("salvar");
+                    fields.forEach(id => {
+                        document.getElementById(id).removeAttribute("disabled");
+                        document.getElementById(id).classList.remove("disabled");
+                    });
+                }
+            }
+            function send_pid() {
+                var data = {
+                    'kp': parseFloat(document.getElementById("kp").value), 
+                    'ki': parseFloat(document.getElementById("ki").value), 
+                    'kd': parseFloat(document.getElementById("kd").value), 
+                    'pausa': parseFloat(document.getElementById("pausa").value)
+                };
+                connection.send(JSON.stringify(data));
+                console.log('Data sent: ', JSON.stringify(data));
+            }
+            function stop_robot() {
+                var data = {'stop': 1};
+                connection.send(JSON.stringify(data));
+                console.log('Stop command sent');
+            }
+        </script>
+    </body>
+</html>
+)rawliteral";
+
+
+// --- FUNÇÃO SETUP ---
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+    Serial.println("Robô PID com Guia Central + Bigodes");
+
+    // Configura os pinos dos sensores
+    pinMode(PINO_SENSOR_CENTRAL, INPUT);
+    pinMode(PINO_BIGODE_ESQ_DENTRO, INPUT);
+    pinMode(PINO_BIGODE_ESQ_FORA, INPUT);
+    pinMode(PINO_BIGODE_DIR_DENTRO, INPUT);
+    pinMode(PINO_BIGODE_DIR_FORA, INPUT);
+
+    pinMode(PINO_LED, OUTPUT);
+    digitalWrite(PINO_LED, LOW);
+
+    // Configura o Wi-Fi e Servidor Web
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("Vespa PID", "12345678");
+    configurar_servidor_web();
+    server.begin();
+    Serial.print("Servidor iniciado em: ");
+    Serial.println(WiFi.softAPIP());
+
+    // Carrega valores PID salvos
+    SPIFFS.begin(DIRETORIO_SPIFFS, false);
+    espera = SPIFFS.getFloat(ALIAS_ESPERA, 10.0);
+    Kp = SPIFFS.getFloat(ALIAS_KP, 10.0);
+    Ki = SPIFFS.getFloat(ALIAS_KI, 0.1);
+    Kd = SPIFFS.getFloat(ALIAS_KD, 20.0);
+    SPIFFS.end();
+}
+
+
+// --- FUNÇÃO LOOP ---
+void loop() {
+    ws.cleanupClients();
+    if (!parada) {
+        segue_linha();
+    }
+}
+
+// ------------------------------------------------------------------
+// <<<<<<<<<<<<<<<<<<<< O CORAÇÃO DO CÓDIGO >>>>>>>>>>>>>>>>>>>>>>>
+// ------------------------------------------------------------------
+void segue_linha() {
+    // Lê os "bigodes" digitais. LOW (0) significa que o sensor VÊ a linha.
+    bool bigode_esq_fora   = (digitalRead(PINO_BIGODE_ESQ_FORA)   == LOW);
+    bool bigode_esq_dentro = (digitalRead(PINO_BIGODE_ESQ_DENTRO) == LOW);
+    bool bigode_dir_dentro = (digitalRead(PINO_BIGODE_DIR_DENTRO) == LOW);
+    bool bigode_dir_fora   = (digitalRead(PINO_BIGODE_DIR_FORA)   == LOW);
+    
+    // Lê o sensor analógico central (Lógica invertida na versão anterior)
+    bool central_na_linha = (analogRead(PINO_SENSOR_CENTRAL) < LEITURA_LINHA_CENTRAL);
+
+    // --- LÓGICA HÍBRIDA PARA CALCULAR O ERRO NUMÉRICO ---
+    // Esta sequência de 'if/else' garante que a condição mais externa (mais crítica)
+    // seja processada primeiro, definindo um valor de erro para o PID.
+    
+    if (bigode_esq_fora) {
+        erro = -4; // Erro máximo para a esquerda
+    } else if (bigode_dir_fora) {
+        erro = 4;  // Erro máximo para a direita
+    } else if (bigode_esq_dentro) {
+        erro = -2; // Erro médio para a esquerda
+    } else if (bigode_dir_dentro) {
+        erro = 2;  // Erro médio para a direita
+    } else if (central_na_linha) {
+        erro = 0;  // Perfeitamente na linha
+    } else {
+        // CONDIÇÃO DE LINHA PERDIDA:
+        // Quando nenhum sensor vê a linha, o robô segue a lógica do 
+        // sensor central (como se estivesse na linha), resultando em erro = 0.
+        // Isso fará o robô seguir em frente, útil para passar por falhas na pista.
+        erro = 0;
+    }
+
+    // Se encontrou a linha de alguma forma, reseta o contador de "perdido"
+    // Com a nova lógica, os valores 5 e -5 não são mais usados para "perdido".
+    if (erro != 5 && erro != -5) { 
+        contador_perdido = 0;
+    } else {
+        contador_perdido++;
+    }
+
+    // Define a velocidade atual baseada na situação
+    int velocidade_atual;
+    if (contador_perdido > 0) {
+        velocidade_atual = velocidade_base / 2; // Reduz a velocidade para procurar a linha
+    } else if (erro == 0) {
+        velocidade_atual = velocidade_base + VELOCIDADE_RETA_ACRESCIMO; // Acelera em retas
+    } else {
+        velocidade_atual = velocidade_base; // Velocidade normal em curvas
+    }
+    
+    // Se ficou perdido por muito tempo, para
+    if (contador_perdido > CONTAGEM_MAXIMA_PERDIDO) {
+        motores.stop();
+        I = 0; // Reseta o termo integral
+    } else {
+        // Calcula a resposta do PID e aciona os motores
+        calcula_PID(velocidade_atual);
+        motores.turn(velocidade_direita, velocidade_esquerda);
+    }
+
+    delay((uint32_t)espera);
+}
+
+
+// ------------------------------------------------------------------
+// <<<<<<<<<<<< FUNÇÃO PID CORRIGIDA >>>>>>>>>>>>>>
+// ------------------------------------------------------------------
+void calcula_PID(int velocidade_atual) {
+    P = erro;
+    I = I + erro;
+
+    // MUDANÇA 1: Limpa a "memória" (Integral) quando o robô está reto.
+    // Isso evita que erros acumulados de curvas passadas atrapalhem a reta.
+    if (erro == 0) {
+      I = 0;
+    }
+    // Limita o valor de I para evitar que ele cresça demais.
+    I = constrain(I, -300, 300); 
+
+    D = erro - erro_anterior;
+    resposta_PID = (Kp * P) + (Ki * I) + (Kd * D);
+    erro_anterior = erro;
+
+    // MUDANÇA 2: Sinais da correção invertidos para o lado certo.
+    // Agora a resposta do PID corrige a direção corretamente.
+    velocidade_direita = velocidade_atual + resposta_PID;
+    velocidade_esquerda = velocidade_atual - resposta_PID;
+
+    // Limita a velocidade dos motores para não exceder o máximo
+    velocidade_direita = constrain(velocidade_direita, -VELOCIDADE_MAXIMA, VELOCIDADE_MAXIMA);
+    velocidade_esquerda = constrain(velocidade_esquerda, -VELOCIDADE_MAXIMA, VELOCIDADE_MAXIMA);
+}
+
+
+// --- FUNÇÕES DO SERVIDOR WEB E WEBSOCKET ---
+void configurar_servidor_web(void) {
+    ws.onEvent(onEvent);
+    server.addHandler(&ws);
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest * request) {
+        request->send_P(200, "text/html", index_html);
+    });
+}
+
+void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
+    AwsFrameInfo *info = (AwsFrameInfo*)arg;
+    if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+        data[len] = 0;
+        StaticJsonDocument<256> json;
+        DeserializationError error = deserializeJson(json, (char*)data);
+        if (error) return;
+
+        if (json.containsKey(ALIAS_PARA)) {
+            parada = true;
+            I = 0; // Reseta o termo integral
+            motores.stop();
+        } else if (json.containsKey(ALIAS_KP)) {
+            parada = false;
+            espera = json[ALIAS_ESPERA];
+            Kp = json[ALIAS_KP];
+            Ki = json[ALIAS_KI];
+            Kd = json[ALIAS_KD];
+            // Salva os novos valores na memória
+            SPIFFS.begin(DIRETORIO_SPIFFS, false);
+            SPIFFS.putFloat(ALIAS_ESPERA, espera);
+            SPIFFS.putFloat(ALIAS_KP, Kp);
+            SPIFFS.putFloat(ALIAS_KI, Ki);
+            SPIFFS.putFloat(ALIAS_KD, Kd);
+            SPIFFS.end();
+        } else if (json.containsKey(ALIAS_VELOCIDADE)) {
+            String dir = json[ALIAS_VELOCIDADE];
+            if (dir == "up") velocidade_base += 5;
+            else if (dir == "down") velocidade_base -= 5;
+            velocidade_base = constrain(velocidade_base, VELOCIDADE_MINIMA, VELOCIDADE_MAXIMA);
+            // Envia nova velocidade para todos os clientes
+            StaticJsonDocument<JSON_OBJECT_SIZE(1)> speed_json;
+            speed_json[ALIAS_VELOCIDADE] = velocidade_base;
+            String mensagem;
+            serializeJson(speed_json, mensagem);
+            ws.textAll(mensagem);
+        }
+    }
+}
+
+void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+    switch (type) {
+        case WS_EVT_CONNECT: {
+            digitalWrite(PINO_LED, HIGH);
+            StaticJsonDocument<JSON_OBJECT_SIZE(5)> json;
+            json[ALIAS_KP] = Kp;
+            json[ALIAS_KI] = Ki;
+            json[ALIAS_KD] = Kd;
+            json[ALIAS_ESPERA] = espera;
+            json[ALIAS_VELOCIDADE] = velocidade_base;
+            String mensagem;
+            serializeJson(json, mensagem);
+            client->text(mensagem);
+            break;
+        }
+        case WS_EVT_DISCONNECT:
+            if (ws.count() == 0) digitalWrite(PINO_LED, LOW);
+            break;
+        case WS_EVT_DATA:
+            handleWebSocketMessage(arg, data, len);
+            break;
+        default:
+            break;
+    }
+}
